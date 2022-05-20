@@ -9,8 +9,8 @@ import warnings
 import re
 from collections import defaultdict
 import itertools
-from numba import njit
-import numba
+# from numba import njit
+# import numba
 
 
 
@@ -100,7 +100,7 @@ if ( args.input_affinity_file != "" ):
 if ( args.input_energies_file != "" ):
       energy_df = pd.read_csv(args.input_energies_file, sep="\s+")
       if ( "energy" not in list(energy_df) or "description" not in list(energy_df)):
-            print("--input_energies_file should have 2 columns. 'energies' and 'description'")
+            print("--input_energies_file should have 2 columns. 'energy' and 'description'")
             assert(False)
       energy_df = energy_df[['energy', 'description']].copy()
 
@@ -715,6 +715,7 @@ for seqpos0 in range(len(sequence)):
 max_possible_score = abs(max_possible_score)
 
 
+print("Debug: max_possible_score", max_possible_score)
 
 dp_diversity = np.zeros((len(sequence), max_possible_score+1), np.float64)
 dp_idegen = np.zeros((len(sequence), max_possible_score+1), int)
@@ -727,8 +728,9 @@ dp_idegen[:] -1
 # dp_prev_idx[:] = -1
 
 
+# idk, numba caused this to give different outputs. Don't feel like debugging plus that's super sketch
 # print("Dynamic programming")
-@njit(cache=True)
+# @njit(cache=True)
 def dynamic_programming( dp_diversity, dp_idegen, dp_prev_idx, all_diversities, all_scores, all_idegens ):
 
 # seqpos loop of dynamic programming
@@ -768,14 +770,15 @@ def dynamic_programming( dp_diversity, dp_idegen, dp_prev_idx, all_diversities, 
 
 
 # stupid numba update
-typed_all_diversities = numba.typed.List()
-[typed_all_diversities.append(x) for x in all_diversities]
-typed_all_scores = numba.typed.List()
-[typed_all_scores.append(x) for x in all_scores]
-typed_all_idegens = numba.typed.List()
-[typed_all_idegens.append(x) for x in all_idegens]
+# typed_all_diversities = numba.typed.List()
+# [typed_all_diversities.append(x) for x in all_diversities]
+# typed_all_scores = numba.typed.List()
+# [typed_all_scores.append(x) for x in all_scores]
+# typed_all_idegens = numba.typed.List()
+# [typed_all_idegens.append(x) for x in all_idegens]
 
-dynamic_programming( dp_diversity, dp_idegen, dp_prev_idx, typed_all_diversities, typed_all_scores, typed_all_idegens )
+# dynamic_programming( dp_diversity, dp_idegen, dp_prev_idx, typed_all_diversities, typed_all_scores, typed_all_idegens )
+dynamic_programming( dp_diversity, dp_idegen, dp_prev_idx, all_diversities, all_scores, all_idegens )
 
 
 final_diversities = []
@@ -849,10 +852,12 @@ def fancy_print_dna(dna):
 
 
 our_choice = np.searchsorted(final_diversities, args.max_diversity)
+if ( our_choice == len(final_diversities) ):
+    our_choice -= 1
 
 
 lb = max(0, our_choice-10)
-ub = min(len(final_scores), our_choice+10)
+ub = min(len(final_scores)-1, our_choice+10)
 
 print("Nearby choices: ")
 print(" diversity -- score (max delta kcal/mol)")
