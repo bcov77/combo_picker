@@ -42,6 +42,21 @@ parser.add_argument("--monomer_boundary_weight", type=float, default=0.5, help="
 parser.add_argument("--monomer_surface_weight", type=float, default=0.3, help="Weight factor for seqpos")
 parser.add_argument("--loop_weight", type=float, default=1.0, help="Weight factor for seqpos loop. Overrides other weight factors")
 
+parser.add_argument("--within_category_decay", type=float, default=0.25, help="Per pos score: Within each category, first aa gets full score,"
+                                                                              " second aa gets score*within_category_decay"
+                                                                              " third aa gets score*within_category_decay**2")
+
+parser.add_argument("--between_category_decay", type=float, default=0.5, help="Per pos score: First category gets full score,"
+                                                                              " second category gets score*between_category_decay"
+                                                                              " third category gets score*between_category_decay**2")
+
+parser.add_argument("--extraneous_aa_threshold", type=float, default=1, help="Per pos score: For each aa with score above this included,"
+                                                                             " give extraneous_aa_penalty to codon")
+
+parser.add_argument("--extraneous_aa_penalty", type=float, default=1, help="Per pos score: Score added for each aa above extraneous_aa_threshold")
+
+parser.add_argument("--cys_is_not_extraneous", action="store_true", help="By default, non-native CYS gets the --extraneous_aa_penalty.")
+
 parser.add_argument("--max_diversity", type=float, default=1e7, help="Max diversity that will be output.")
 
 args = parser.parse_args(sys.argv[1:])
@@ -569,7 +584,7 @@ if ( dna_sequence == "" ):
 # +inf if poison allowed
 
 
-aa_order = 'CPGAVIMLFYWSTNQDERKH'
+aa_order = 'CPGAVIMLFYWSTNQDERKH*'
 aa_to_offset = {}
 for iletter, letter in enumerate(aa_order):
     aa_to_offset[letter] = iletter
@@ -582,7 +597,7 @@ for cat, letters in categories.items():
         mask[aa_to_offset[letter]] = True
     category_masks.append(mask)
 
-
+# figure out which aas a given degenerate codon is going to produce
 degen_codon_to_mask_and_diveristy = {}
 for codon1 in all_codons:
     codons1 = all_codons[codon1]
@@ -592,14 +607,15 @@ for codon1 in all_codons:
             codons3 = all_codons[codon3]
 
             diversity = len(codons1)*len(codons2)*len(codons3)
-            mask = np.zeros(len(aa_order), bool)
+            sum_mask = np.zeros(len(aa_order), int)
             for c1, c2, c3 in itertools.product(codons1, codons2, codons3):
                 letter = codon_to_aa[c1+c2+c3]
-                if ( letter != "*" ):
-                    mask[aa_to_offset[letter]] = True
+                sum_mask[aa_to_offset[letter]] += 1
 
+            mask = sum_mask > 0
+            assert(sum_mask.sum() == diversity)
 
-            degen_codon_to_mask_and_diveristy[codon1 + codon2 + codon3] = (mask, diversity)
+            degen_codon_to_mask_and_diveristy[codon1 + codon2 + codon3] = (mask, sum_mask, diversity)
 
 all_degen_order = list(degen_codon_to_mask_and_diveristy)
 base_degen = len(all_degen_order)
@@ -611,45 +627,87 @@ aa_offsets = df['ssm_letter'].map(aa_to_offset).values
 seqpos_offsets = df['ssm_seqpos'].astype(int).values - 1
 denergies = df['delta_energy'].values * df['position_weight_factor'].values
 
+# Put the aa energies into the score table
 score_table[tuple((seqpos_offsets, aa_offsets ))] = denergies
+
+# Mark all stop codons as extraneous
+score_table[:, aa_to_offset['*']] = args.extraneous_aa_threshold
+
+# Mark all non-native CYS as extraneous
+if ( not args.cys_is_not_extraneous ):
+    for seqpos0 in range(len(sequence)):
+        if ( sequence[seqpos0] != "C" ):
+            score_table[seqpos0, aa_to_offset['C']] = args.extraneous_aa_threshold
 
 assert( not np.any( np.isnan(score_table)))
 
-per_position_choices = []
 
 total_combinations = 1
 
-# Tally up all the choices
+# Get all valid degenerate codon choices at each position
+per_position_choices = []
 for seqpos0 in range(len(sequence)):
 
+    # loop through literally every single denerate codon at this position
     this_position_choices = []
     for idegen, degen_codon in enumerate(all_degen_order):
 
-        mask, diversity = degen_codon_to_mask_and_diveristy[degen_codon]
+        # allowed aa mask, and total codons added
+        mask, sum_mask, diversity = degen_codon_to_mask_and_diveristy[degen_codon]
 
         native_aa = sequence[seqpos0]
         native_aa_offset = aa_to_offset[native_aa]
 
+        # native aa must be present
         if ( not mask[native_aa_offset] ):
             continue
 
+        # get aa scores for this seqpos
         our_scores = score_table[seqpos0].copy()
+
+        # figure out extaneous before we set stuff to 0
+        is_extraneous = our_scores >= args.extraneous_aa_threshold
+        is_extraneous[native_aa_offset] = False
+
+        # set all non-present aas to 0 and mark as not extraneous
         our_scores[~mask] = 0
+        is_extraneous[~mask] = False
+
+        # skip this codon if a poison is present
         if ( np.isinf(our_scores).any() ):
             continue
 
+        # find score for each category
         cat_scores = []
         for cat_mask in category_masks:
-            this_score = our_scores[cat_mask].min()
+
+            # all scores for this category
+            sorted_cat_scores = sorted(our_scores[cat_mask])
+
+            # apply --within_category_decay as we sum this category
+            this_score = 0
+            mult = 1
+            for ind_score in sorted_cat_scores:
+                if ( ind_score < 0 ):
+                    this_score += ind_score * mult
+                mult *= args.within_category_decay
+
+            # only add to category scores if below 0
             if ( this_score < 0 ):
                 cat_scores.append(this_score)
+
+        # sum categories using --between_category_decay
         cat_scores = sorted(cat_scores)
         score = 0
         mult = 1
         for cat_score in cat_scores:
             score += cat_score*mult
-            mult *= 0.5
+            mult *= args.between_category_decay
 
+        # for every extraneous aa this will produce (including synonymous sequences) apply the penalty
+        score += sum_mask[is_extraneous].sum() * args.extraneous_aa_penalty
+
+        # add this codon to the list of choices at this positon. Convert score to int
         if ( score < 0 ):
             this_position_choices.append((int(score*100), diversity, idegen))
 
@@ -842,7 +900,7 @@ def fancy_print_dna(dna):
                     allowed_aas.add(letter)
 
         to_print = ""
-        for letter in aa_order + "*":
+        for letter in aa_order:
             if ( letter in allowed_aas ):
                 to_print += letter
 
@@ -872,5 +930,56 @@ final_dna = traceback(final_scores[our_choice])
 fancy_print_dna(final_dna)
 
 
+
+
+def score_dna( dna, sequence ):
+    assert(len(dna) % 3 == 0)
+
+    overall_diversity = 1
+    overall_frac_non_extraneous = 1
+    score = 0
+
+    for seqpos0 in range(len(dna)//3):
+        codon = dna[seqpos0*3:(seqpos0+1)*3]
+
+        mask, sum_mask, diversity = degen_codon_to_mask_and_diveristy[codon]
+
+        overall_diversity *= diversity
+
+        our_scores = score_table[seqpos0]
+        is_extraneous = our_scores >= args.extraneous_aa_threshold
+        is_extraneous[aa_to_offset[sequence[seqpos0]]] = False
+
+        extraneous_sum = sum_mask[is_extraneous].sum()
+        good_sum = diversity - extraneous_sum
+
+        overall_frac_non_extraneous *= good_sum / diversity
+
+
+    return 0, overall_frac_non_extraneous, overall_diversity
+
+
+
+score, frac_non_extraneous, diversity = score_dna( final_dna, sequence )
+
+assert(np.isclose(diversity, final_diversities[our_choice]))
+
+print("")
+print("DNA Diversity: %6.1e"%diversity)
+print("Percent desired aa: %.2f%%"%(frac_non_extraneous*100))
+print("")
+
 print("DNA:")
 print(final_dna)
+
+
+
+
+
+
+
+
+
+
+
+
