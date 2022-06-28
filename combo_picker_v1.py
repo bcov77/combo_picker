@@ -33,6 +33,7 @@ parser.add_argument("--kcal_per_better_sap", type=float, default="0.25", help="I
 parser.add_argument("--kcal_per_worse_sap", type=float, default="1.5", help="If sap gets worse, how many kcal per sap")
 parser.add_argument("--dsap_poison_threshold", type=float, default="2", help="If sap increases by more than this and the adjusted energy is"
                                                                              " > 0. Consider this to be a poison mutation.")
+parser.add_argument("--poison_even_if_better", action="store_true", help="Even if the energy is < 0, big dsap residues are still poison")
 parser.add_argument("--dna_sequence", type=str, default="", help="DNA sequence or we'll just pick the best codon at each position")
 
 parser.add_argument("--interface_core_weight", type=float, default=1, help="Weight factor for seqpos")
@@ -59,6 +60,16 @@ parser.add_argument("--cys_is_not_extraneous", action="store_true", help="By def
 
 parser.add_argument("--max_diversity", type=float, default=1e7, help="Max diversity that will be output.")
 
+parser.add_argument("--focus_positions", type=str, default="", help="These comma-separated positions get their scores multiplied by --focus_multiplier")
+parser.add_argument("--focus_multiplier", type=float, default=5, help="Score multiplier for focus positions")
+
+parser.add_argument("--internal_inv_score_resl", type=float, default=100, help="Score resolution for calculations. Probably don't change this."
+                                                                            " Only change if you're doing something weird and script is slow. Try 10")
+
+parser.add_argument("--user_override", type=str, default="", help="Comma separated list of positions and mutations that get assigned --user_override_score."
+                                                                " Example. 4DEQ,7NEV,15LR ")
+parser.add_argument("--user_override_score", type=float, default=-10, help="Score assigned for user_override mutations")
+
 args = parser.parse_args(sys.argv[1:])
 
 print("Loading pyrosetta")
@@ -76,6 +87,10 @@ def fix_scorefxn(sfxn):
     sfxn.set_energy_method_options(opts)
 scorefxn = get_fa_scorefxn()
 fix_scorefxn(scorefxn)
+
+focus_positions = []
+if ( args.focus_positions != "" ):
+    focus_positions = [int(x) for x in args.focus_positions.split(",")]
 
 
 sfxn_fast = core.scoring.ScoreFunctionFactory.create_score_function("none")
@@ -445,7 +460,10 @@ sap_up = df['delta_sap'] > 0
 df.loc[sap_up, 'delta_energy'] += df[sap_up]['delta_sap'] * args.kcal_per_worse_sap
 df.loc[~sap_up, 'delta_energy'] += df[~sap_up]['delta_sap'] * args.kcal_per_better_sap
 
-df['is_poison'] = (df['delta_sap'] > args.dsap_poison_threshold) & (df['delta_energy'] > 0)
+if ( args.poison_even_if_better ):
+    df['is_poison'] = (df['delta_sap'] > args.dsap_poison_threshold)
+else:
+    df['is_poison'] = (df['delta_sap'] > args.dsap_poison_threshold) & (df['delta_energy'] > 0)
 
 df.loc[df['is_poison'], 'delta_energy'] = np.inf
 
@@ -470,6 +488,29 @@ df.loc[df['is_monomer_core'], 'position_weight_factor'] = args.monomer_core_weig
 df.loc[df['is_monomer_boundary'], 'position_weight_factor'] = args.monomer_boundary_weight
 df.loc[df['is_monomer_surface'], 'position_weight_factor'] = args.monomer_surface_weight
 df.loc[df['is_loop'], 'position_weight_factor'] = args.loop_weight                          # keep this last because it's not mutually exclusive
+
+
+if ( args.user_override != "" ):
+    for group in args.user_override.split(","):
+        groups = re.match("([0-9]+)([A-Z]+)", group)
+        if ( groups is None ):
+            print("Bad user_override specification", group)
+            assert(False)
+        seqpos = int(groups.group(1))
+        letters = groups.group(2)
+        for letter in letters:
+            mask = (df['ssm_seqpos'].astype(int) == seqpos) & (df['ssm_letter'] == letter)
+            
+            # we're cancelling out the region-specific weight here
+            df.loc[mask, 'delta_energy'] = args.user_override_score / df[mask]['position_weight_factor']
+
+
+for focus_position in focus_positions:
+    df.loc[df['ssm_seqpos'].astype(int) == focus_position, 'position_weight_factor'] *= args.focus_multiplier
+
+
+
+
 
 
 codon_to_aa = {
@@ -709,7 +750,7 @@ for seqpos0 in range(len(sequence)):
 
         # add this codon to the list of choices at this positon. Convert score to int
         if ( score < 0 ):
-            this_position_choices.append((int(score*100), diversity, idegen))
+            this_position_choices.append((int(score*args.internal_inv_score_resl), diversity, idegen))
 
     per_position_choices.append(np.array(this_position_choices))
     total_combinations *= max(len(this_position_choices), 1)
@@ -855,7 +896,7 @@ for score in reversed(range(max_possible_score+1)):
 final_diversities = list(reversed(final_diversities))
 final_scores = list(reversed(final_scores))
 
-def traceback(final_score):
+def traceback(final_score, do_error=False):
     reversed_idegens = []
 
     cur_score = final_score
@@ -875,6 +916,10 @@ def traceback(final_score):
         this_degen = dna_sequence[seqpos0*3:(seqpos0+1)*3]
         if ( idegen < base_degen ):
             this_degen = all_degen_order[idegen]
+        else:
+            if ( do_error and codon_to_aa[this_degen] != sequence[seqpos0] ):
+                print("DNA -- protein mismatch at position %i. AA=%s DNA=%s"%(seqpos0+1, sequence[seqpos0], codon_to_aa[this_degen]))
+                assert( False )
         final_dna += this_degen
 
     return final_dna
@@ -921,12 +966,12 @@ print("Nearby choices: ")
 print(" diversity -- score (max delta kcal/mol)")
 for choice in range(lb, ub+1):
     prefix = "   " if choice != our_choice else "***"
-    print(prefix + "%6.1e -- %.2f"%(final_diversities[choice], final_scores[choice]/-100))
+    print(prefix + "%6.1e -- %.2f"%(final_diversities[choice], final_scores[choice]/-args.internal_inv_score_resl))
 
 
 print("Selected: ")
 
-final_dna = traceback(final_scores[our_choice])
+final_dna = traceback(final_scores[our_choice], do_error=True)
 fancy_print_dna(final_dna)
 
 
